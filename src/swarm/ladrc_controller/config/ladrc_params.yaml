@@ -1,0 +1,25 @@
+ladrc_position_controller:
+  ros__parameters:
+    # Control frequency (Hz)
+    control_frequency: 50.0
+    
+    # X-axis LADRC parameters
+    omega_o_x: 2.0      # Observer bandwidth
+    omega_c_x: 0.8       # Controller bandwidth
+    b0_x: 0.8            # Control gain estimate
+    
+    # Y-axis LADRC parameters
+    omega_o_y: 2.0
+    omega_c_y: 0.8
+    b0_y: 0.8
+    
+    # Z-axis LADRC parameters
+    omega_o_z: 14.0
+    omega_c_z: 3.2
+    b0_z: 0.7
+    
+    # Limits
+    max_velocity: 5.0          # m/s
+    max_acceleration_x: 3.0    # m/s^2
+    max_acceleration_y: 3.0    # m/s^2
+    max_acceleration_z: 4.5    # m/s^2

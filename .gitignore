@@ -1,0 +1,13 @@
+# ROS2 编译生成文件夹
+build/
+install/
+log/
+
+# Python 缓存和虚拟环境
+__pycache__/
+*.pyc
+.env/
+venv/
+
+# VS Code 配置
+.vscode/
