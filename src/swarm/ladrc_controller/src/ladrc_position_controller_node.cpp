@@ -4,11 +4,15 @@
 #include <geometry_msgs/msg/accel_stamped.hpp>
 #include <px4_msgs/msg/vehicle_odometry.hpp>
 #include <px4_msgs/msg/offboard_control_mode.hpp>
-#include <px4_msgs/msg/vehicle_attitude_setpoint.hpp> // <-- [核心修改 1] 使用底层的姿态推力指令
+#include <px4_msgs/msg/vehicle_attitude_setpoint.hpp> 
 #include <px4_msgs/msg/vehicle_command.hpp>
 #include "ladrc_controller/ladrc_core.hpp"
+#include <geometry_msgs/msg/vector3_stamped.hpp>
 
-#include <Eigen/Dense> // <-- [核心修改 2] 引入 Eigen 进行底层姿态映射解算
+#include <map>
+#include <vector>
+#include <string>
+#include <Eigen/Dense> 
 #include <cmath>
 #include <chrono>
 #include <atomic>
@@ -41,6 +45,41 @@ public:
 
     // [多机改造 1] 声明系统 ID 参数，用于区分不同的无人机
     this->declare_parameter("sys_id", 1);
+
+    // [拓扑构建] 声明邻居名单参数 (默认无邻居)
+    this->declare_parameter("neighbor_ids", std::vector<int64_t>{});
+    
+    // 初始化自身估计器广播器 (发布到自己的命名空间下)
+    ahat_pub_ = this->create_publisher<geometry_msgs::msg::Vector3Stamped>("estimator/a_hat", 10);
+
+    // 获取当前无人机的 ID 和 它的邻居名单
+    sys_id_ = this->get_parameter("sys_id").as_int();
+    std::vector<int64_t> neighbors = this->get_parameter("neighbor_ids").as_integer_array();
+
+    // 遍历邻居名单，利用 Lambda 表达式为每一个邻居动态创建专属订阅器
+    for (int64_t n_id : neighbors) {
+        // 跨命名空间订阅：拼凑绝对路径话题名
+        std::string n_odom_topic = "/px4_" + std::to_string(n_id) + "/fmu/out/vehicle_odometry";
+        std::string n_ahat_topic = "/px4_" + std::to_string(n_id) + "/estimator/a_hat";
+
+        // 订阅邻居的里程计
+        auto odom_sub = this->create_subscription<px4_msgs::msg::VehicleOdometry>(
+            n_odom_topic, rclcpp::SensorDataQoS(),
+            [this, n_id](const px4_msgs::msg::VehicleOdometry::SharedPtr msg) {
+                this->neighbor_odom_map_[n_id] = *msg; // 存入字典
+            });
+        neighbor_odom_subs_.push_back(odom_sub);
+
+        // 订阅邻居的估计器前馈信号
+        auto ahat_sub = this->create_subscription<geometry_msgs::msg::Vector3Stamped>(
+            n_ahat_topic, rclcpp::QoS(10),
+            [this, n_id](const geometry_msgs::msg::Vector3Stamped::SharedPtr msg) {
+                this->neighbor_ahat_map_[n_id] = *msg; // 存入字典
+            });
+        neighbor_ahat_subs_.push_back(ahat_sub);
+
+        RCLCPP_INFO(this->get_logger(), "🌐 [拓扑图构建成功] UAV %d -> 监听 -> UAV %ld", sys_id_, n_id);
+    }
 
     double control_freq = this->get_parameter("control_frequency").as_double();
     dt_ = 1.0 / control_freq;
@@ -174,10 +213,49 @@ private:
     }
   }
 
+  void publishTopologyProbe()
+  {
+    if (!has_odom_) {
+      return;
+    }
+
+    // 模拟分布式估计器输出（目前发一个假的识别码，证明通信通了）
+    geometry_msgs::msg::Vector3Stamped ahat_msg;
+    const uint64_t ts_us = getPx4TimestampUs();
+    ahat_msg.header.stamp.sec = static_cast<int32_t>(ts_us / 1000000ULL);
+    ahat_msg.header.stamp.nanosec = static_cast<uint32_t>((ts_us % 1000000ULL) * 1000ULL);
+    ahat_msg.vector.x = static_cast<double>(sys_id_); // 把自己的 ID 伪装成 a_hat 发出去
+    ahat_msg.vector.y = 0.0;
+    ahat_msg.vector.z = 0.0;
+    ahat_pub_->publish(ahat_msg);
+
+    // 定期打印自己听到的邻居信息
+    if (++topo_log_counter_ >= 100) {
+      if (neighbor_odom_map_.empty()) {
+        RCLCPP_INFO(this->get_logger(), "🔗 [通信探针] UAV %d 当前未缓存到邻居里程计数据", sys_id_);
+      } else {
+        for (const auto& pair : neighbor_odom_map_) {
+          int n_id = pair.first;
+          // 提取邻居的 ENU 坐标
+          double nx = pair.second.position[1];
+          double ny = pair.second.position[0];
+          double nz = -pair.second.position[2];
+
+          RCLCPP_INFO(this->get_logger(), "🔗 [通信探针] 我是 UAV %d, 我听到了邻居 UAV %d 的实时位置: X:%.2f, Y:%.2f, Z:%.2f",
+                      sys_id_, n_id, nx, ny, nz);
+        }
+      }
+      topo_log_counter_ = 0;
+    }
+  }
+
   void controlLoop()
   {
     // 持续发布 offboard 模式心跳
     publishOffboardControlMode();
+
+    // 持续发布/打印拓扑通信探针（每 100 个控制周期打印一次）
+    publishTopologyProbe();
 
     // [核心修复] 在状态机未进入正式飞行前，必须持续向 PX4 发送待机 Setpoint！
     // 否则 PX4 会因为“未接收到设定点”而拒绝解锁和进入 Offboard 模式。
@@ -202,6 +280,7 @@ private:
         RCLCPP_INFO(this->get_logger(), "等待状态机激活或等待话题... 当前状态: %d", (int)flight_state_.load());
         log_counter_ = 0;
       }
+
       return;
     }
 
@@ -346,10 +425,26 @@ private:
 
   int log_counter_ = 0;
   std::atomic<uint64_t> px4_timestamp_us_{0};
+  int sys_id_ = 1;
 
   std::atomic<FlightState> flight_state_;
   std::atomic<uint64_t> offboard_setpoint_counter_;
   double dt_;
+
+
+  // === 分布式拓扑通信核心容器 ===
+  // 存储邻居的最新里程计(位置/速度)和估计器(前馈加速度)数据
+  std::map<int, px4_msgs::msg::VehicleOdometry> neighbor_odom_map_;
+  std::map<int, geometry_msgs::msg::Vector3Stamped> neighbor_ahat_map_;
+
+  // 动态订阅器句柄数组
+  std::vector<rclcpp::Subscription<px4_msgs::msg::VehicleOdometry>::SharedPtr> neighbor_odom_subs_;
+  std::vector<rclcpp::Subscription<geometry_msgs::msg::Vector3Stamped>::SharedPtr> neighbor_ahat_subs_;
+  
+  // 自身的估计器广播器
+  rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr ahat_pub_;
+
+  int topo_log_counter_ = 0;
 };
 
 int main(int argc, char **argv)
